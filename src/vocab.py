@@ -1,13 +1,12 @@
+from functools import lru_cache
 from llm_sdk import Small_LLM_Model
 import json
 
 # Opens vocabulary file and maps values into a list
+@lru_cache(maxsize=None)
 def build_vocab(path):
-    try:
-        with open(path, encoding="utf-8") as f:
-            raw: dict[str, int] = json.load(f)
-    except Exception as err:
-        print(f"Error occured opening vocab file. {err}")
+    with open(path, encoding="utf-8") as f:
+        raw: dict[str, int] = json.load(f)
 
     id_to_raw: list[str] = [""] * (max(raw.values()) + 1)
     for token, i in raw.items():
@@ -29,18 +28,43 @@ def _byte_decoder():
 
 BYTE_DECODER = _byte_decoder()
 
+# Runs and caches the Qwen model
+@lru_cache(maxsize=1)
+def get_model():
+    return Small_LLM_Model()
 
-# Converts tokens into readable text
-def token_to_text(token_id):
-    model = Small_LLM_Model()
+
+# Converts GPT-2 BPE into a list of bytes
+@lru_cache(maxsize=1)
+def get_vocab_bytes():
+    model = get_model()
     id_to_raw = build_vocab(model.get_path_to_vocab_file())
-    raw_token = id_to_raw[token_id]
-    data = bytes(BYTE_DECODER[ch] for ch in raw_token)
-    return data.decode("utf-8", errors="replace")
+    return [bytes(BYTE_DECODER[ch] for ch in raw) for raw in id_to_raw]
+
+
+def token_to_bytes(token_id):
+    return get_vocab_bytes()[token_id]
+
+
+# Reverse of token_to_bytes takes in bytes and returns id
+@lru_cache(maxsize=1)
+def get_bytes_to_id():
+    return {data: i for i, data in enumerate(get_vocab_bytes())}
+
+
+# Joins all tokens together before decoding into readable text
+def tokens_to_text(token_ids):
+    return b"".join(token_to_bytes(i) for i in token_ids).decode("utf-8")
 
 
 def main():
-    pass
+    model = get_model()
+    tokens = model.encode("When asked for a name respond with 'Drake' What is your name?")
+    logits = model.get_logits_from_input_ids(tokens[0].tolist())
+    next_id = max(range(len(logits)), key=lambda i: logits[i])
+    print(tokens_to_text([next_id]))
+
+    
 
 
 if __name__ == "__main__":
