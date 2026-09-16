@@ -1,7 +1,8 @@
 from functools import lru_cache
-from typing import Sequence
+from typing import Any, Sequence
 
 import numpy as np
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr
 
 from .trie import get_trie
 from .vocab import get_vocab_bytes, token_to_bytes
@@ -9,60 +10,72 @@ from .vocab import get_vocab_bytes, token_to_bytes
 # Bytes that a number can contain
 NUMBER_BYTES = set(b"0123456789.-")
 
-# Bytes that are unsafe for strings
-STRING_UNSAFE = set(b'"\\') | set(range(0x20))
+# Control bytes are never allowed inside a JSON string
+CONTROL_BYTES = set(range(0x20))
+
+# Bytes allowed right after a backslash (\uXXXX is left out)
+ESCAPE_BYTES = set(b'"\\/bfnrt')
+
+BACKSLASH = ord("\\")
+QUOTE = ord('"')
 
 
-class ClosedChoice:
-    def __init__(self, options: Sequence[str], terminator: str = '"') -> None:
-        if not options:
-            raise ValueError("a closed choice needs at least one option")
-        self.options: list[str] = list(options)
-        self._targets: list[bytes] = [
-            (option + terminator).encode("utf-8") for option in self.options
+class ClosedChoice(BaseModel):
+    """Limits output to any fixed list of strings"""
+    model_config = ConfigDict(extra="forbid")
+
+    options: list[str] = Field(min_length=1)
+    terminator: str = '"'
+    emitted: bytes = b""
+    match: int | None = None
+    _targets: list[bytes] = PrivateAttr(default_factory=list)
+    _alive: list[int] = PrivateAttr(default_factory=list)
+
+    def model_post_init(self, context: Any) -> None:
+        """Encodes every option with its terminator and marks all alive"""
+        self._targets = [
+            (option + self.terminator).encode("utf-8")
+            for option in self.options
         ]
-        self._emitted: bytes = b""
-        self._alive: list[int] = list(range(len(self.options)))
-        self._match: int | None = None
-
-    @property
-    def done(self) -> bool:
-        return self._match is not None
-
-    @property
-    def emitted(self) -> bytes:
-        return self._emitted
+        self._alive = list(range(len(self.options)))
 
     def allowed(self) -> set[int]:
+        """
+        Keeps track of tokens that are allowed as long as
+        it adheres to possible options
+        """
         trie = get_trie()
         allowed: set[int] = set()
         for index in self._alive:
-            suffix = self._targets[index][len(self._emitted):]
+            suffix = self._targets[index][len(self.emitted):]
             for token_id, _ in trie.prefixes_of(suffix):
                 allowed.add(token_id)
         return allowed
 
     def advance(self, token_id: int) -> None:
-        self._emitted += token_to_bytes(token_id)
+        """Adds one token's bytes and drops options that don't fit"""
+        self.emitted += token_to_bytes(token_id)
         self._alive = [
             index for index in self._alive
-            if self._targets[index].startswith(self._emitted)
+            if self._targets[index].startswith(self.emitted)
         ]
         if not self._alive:
             raise ValueError(f"token {token_id} left no option reachable")
         for index in self._alive:
-            if self._targets[index] == self._emitted:
-                self._match = index
+            if self._targets[index] == self.emitted:
+                self.match = index
                 break
 
     def value(self) -> str:
-        if self._match is None:
+        """Returns the chosen option"""
+        if self.match is None:
             raise RuntimeError("closed choice slot is not finished")
-        return self.options[self._match]
+        return self.options[self.match]
 
 
 @lru_cache(maxsize=1)
 def number_token_ids() -> set[int]:
+    """Returns token_ids for valid number patterns"""
     return set(
         token_id
         for token_id, data in enumerate(get_vocab_bytes())
@@ -70,16 +83,55 @@ def number_token_ids() -> set[int]:
     )
 
 
-@lru_cache(maxsize=1)
-def string_token_ids() -> set[int]:
-    return set(
-        token_id
-        for token_id, data in enumerate(get_vocab_bytes())
-        if data and not any(byte in STRING_UNSAFE for byte in data)
-    )
+def _scan_string_token(
+    data: bytes, escaped: bool
+) -> tuple[int | None, bool] | None:
+    """
+    Handles string bytes by scanning for valid/invalid data
+    """
+    for index, byte in enumerate(data):
+        if byte in CONTROL_BYTES:
+            return None
+        if escaped:
+            if byte not in ESCAPE_BYTES:
+                return None
+            escaped = False
+        elif byte == BACKSLASH:
+            escaped = True
+        elif byte == QUOTE:
+            return index, False
+    return None, escaped
+
+
+@lru_cache(maxsize=2)
+def string_tokens(
+    escaped: bool,
+) -> tuple[dict[int, bool], dict[int, bytes], set[int]]:
+    """
+    Returns valid string tokens while taking care of backslashes
+    """
+    content: dict[int, bool] = {}
+    closing: dict[int, bytes] = {}
+    for token_id, data in enumerate(get_vocab_bytes()):
+        if not data:
+            continue
+        scan = _scan_string_token(data, escaped)
+        if scan is None:
+            continue
+        quote_index, ends_escaped = scan
+        if quote_index is None:
+            content[token_id] = ends_escaped
+        else:
+            closing[token_id] = data[:quote_index]
+    return content, closing, set(content) | set(closing)
 
 
 def masked_argmax(logits: Sequence[float], allowed: set[int]) -> int:
+    """
+    Returns the allowed token with the highest logit value.
+    Instead of setting disallowed values to -inf, they are
+    ignored and filtered out from the possible options.
+    """
     if not allowed:
         raise ValueError("no token satisfies the current constraint")
     scores = np.asarray(logits, dtype=np.float32)

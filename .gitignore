@@ -1,0 +1,17 @@
+# Virtual environment (recreated by `uv sync`)
+.venv/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Tool caches
+.mypy_cache/
+.pytest_cache/
+
+# Generated output
+data/output/
+
+# OS
+.DS_Store

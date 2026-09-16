@@ -10,7 +10,12 @@ package = false
 [tool.uv.sources]
 llm_sdk = { path = "llm_sdk", editable = true }
 
+[tool.mypy]
+mypy_path = "llm_sdk"
+exclude = '''(^|/)(\.venv|llm_sdk|data)/'''
+
 [dependency-groups]
 dev = [
-    "pytest>=9.1.1",
+    "flake8",
+    "mypy",
 ]

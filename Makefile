@@ -10,7 +10,9 @@ debug:
 	uv run python -m pdb -m src
 
 clean:
-	rm -rf __pycache__ .mypy_cache .pytest_cache src/__pycache__
+	find . -path ./.venv -prune -o -type d -name __pycache__ -exec rm -rf {} +
+	find . -path ./.venv -prune -o -type f -name "*.py[cod]" -exec rm -f {} +
+	rm -rf .mypy_cache .pytest_cache data/output
 
 lint:
 	uv run flake8 .
