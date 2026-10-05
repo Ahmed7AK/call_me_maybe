@@ -51,14 +51,14 @@ With custom paths:
 uv run python -m src \
     --functions_definition data/input/functions_definition.json \
     --input data/input/function_calling_tests.json \
-    --output data/output/function_calling_results.json
+    --output data/output/function_calls.json
 ```
 
 | Option | Default |
 |---|---|
 | `--functions_definition` | `data/input/functions_definition.json` |
 | `--input` | `data/input/function_calling_tests.json` |
-| `--output` | `data/output/function_calling_results.json` |
+| `--output` | `data/output/function_calls.json` |
 
 ### Other Makefile rules
 
@@ -85,10 +85,10 @@ Run:
 $ make run
 [1/2] Greet shrek
 [2/2] Replace all vowels in 'Programming is fun' with asterisks
-Wrote 2/2 calls to data/output/function_calling_results.json
+Wrote 2/2 calls to data/output/function_calls.json
 ```
 
-Output (`function_calling_results.json`):
+Output (`function_calls.json`):
 
 ```json
 [
@@ -102,14 +102,14 @@ Output (`function_calling_results.json`):
     "name": "fn_substitute_string_with_regex",
     "parameters": {
       "source_string": "Programming is fun",
-      "regex": "([aeiouAEIOU])",
+      "regex": "[aeiou]",
       "replacement": "*"
     }
   }
 ]
 ```
 
-Errors are reported on stderr with a clear message, for example:
+Errors are reported with a clear message and exit code 1, for example:
 
 ```bash
 $ uv run python -m src --input missing.json
@@ -129,7 +129,7 @@ mapping, so every token id maps to the exact bytes it produces.
 
 `src/trie.py` builds a trie over those bytes: one node per byte, with a
 token id stored on the node where a token ends. Given a target such as
-`fn_greet"`, walking the trie returns every token that is a prefix of
+`fn_greet",`, walking the trie returns every token that is a prefix of
 the target in a single pass, instead of checking all ~150k tokens.
 
 ### 3. JSON skeleton
@@ -138,11 +138,21 @@ The program writes the fixed parts of the JSON itself and only lets the
 model fill in the values:
 
 ```
-{"name": "<name slot>", "parameters": {"<key>": <value slot>, ...}}
+{"name": "<name slot>", "parameters": {"<key>":<value slot>, ...}}
 ```
 
 The keys come from the chosen function's definition, so they are always
 exactly the declared ones, in order.
+
+The skeleton stops right after each colon, without the usual space, and
+the name slot ends with `",` rather than a lone `"`. The model's
+tokenizer merges these characters with their neighbours (` -`, ` "/`,
+`",`), so cutting the text in the middle of such a token leaves the
+model at a boundary it never saw in training and pushes it toward the
+wrong continuation: negative numbers lost their sign, paths lost their
+leading `/`, and `fn_get` lost to `fn_get_user`. Letting the model's
+first token carry the space and opening quote (a technique known as
+token healing) avoids this.
 
 ### 4. Filling the slots
 
@@ -154,10 +164,11 @@ negative infinity.
 
 | Slot | Allowed tokens |
 |---|---|
-| Function name | Tokens that keep the text a prefix of `<function name>"` for at least one remaining function (`ClosedChoice` + trie). The slot ends when an option is fully matched. |
-| `string` | Tokens that are valid JSON string content: no control characters, and every backslash is followed by a valid escape. A token such as `",` closes the string; only the part before the quote is kept. The value is then unescaped with `json.loads`. |
-| `number` | Tokens made only of `0-9`, `.` and `-`. Generation stops when the model's own top choice is no longer a number token, and the result is cleaned with a regex (`1.2.3` becomes `1.2`) and written as a float. |
-| `boolean` | A `ClosedChoice` between `true` and `false`. |
+| Function name | Tokens that keep the text a prefix of `<function name>",` for at least one remaining function (`ClosedChoice` + trie). The slot ends when an option is fully matched. |
+| `string` | First token: an optional space, the opening quote, then any valid content (` "`, ` "/`, ` "\\`). After that, tokens that are valid JSON string content: no control characters, and every backslash is followed by a valid escape. A token such as `",` closes the string; only the part before the quote is kept. The value is then unescaped with `json.loads`. |
+| `number` | First token: a number token, optionally led by a space (` -`, ` `). After that, tokens made only of `0-9`, `.` and `-`. Generation stops when the model's own top choice is no longer a number token, and the result is cleaned with a regex (`1.2.3` becomes `1.2`) and written as a float. |
+| `integer` | Same as `number`, but `.` is never allowed, so the model cannot start a decimal. The result is cleaned with a regex (`1-2` becomes `1`) and written as an int. |
+| `boolean` | A space, then a `ClosedChoice` between `true` and `false`. |
 
 Every slot is limited to `MAX_SLOT_TOKENS` (64) tokens so generation
 always ends.
@@ -167,16 +178,12 @@ always ends.
 The request is wrapped in Qwen3's chat template with an empty
 `<think></think>` block (thinking disabled). The system prompt lists
 every function with its parameter types and description, tells the model
-to write actual values rather than descriptions, and shows one worked
-example with a made-up function.
-
-### 6. Aliases
-
-For functions that take a regex or pattern parameter, a value that is
-exactly a descriptive word is replaced with what it names
-(`src/aliases.py`): `numbers` becomes `\d+` in the regex parameter, and
-`asterisks` becomes `*` in the other string parameters, unless the prompt
-quotes that word.
+to write actual values rather than descriptions, and shows two worked
+examples with a made-up function: a character class (`[,;]+`) and an
+escaped regex (`\\s+`). With only the escaped example, the model
+reached for a backslash pattern even when a character class was needed
+(`\w+` for "vowels"); with a digit class as the example, it copied
+`[0-9]` for "numbers". The two examples avoid both.
 
 ## Design decisions
 
@@ -196,10 +203,14 @@ quotes that word.
 - **Escape-aware strings.** Allowing valid JSON escapes lets arguments
   contain backslashes (regex patterns, Windows paths) while the output
   stays valid JSON.
-- **Alias dictionary.** The 0.6B model often writes the name of a value
-  ("asterisk") instead of the value (`*`). The dictionary is general,
-  only applies to regex-style functions, only replaces whole values, and
-  never influences which function is chosen.
+- **Token healing at value boundaries.** Each value's first token may
+  carry the space and opening quote, so the model writes the token it
+  would naturally produce (` -5`, ` "/home`) instead of being forced to
+  continue from an unnatural split.
+- **No post-processing of arguments.** An earlier version replaced
+  descriptive words with symbols (`asterisks` to `*`) after generation.
+  It was removed: it overwrote correct answers (a quoted `'numbers'`
+  became `\d+`), and the arguments now come from the model alone.
 - **Pydantic everywhere.** Input files, generated calls and the internal
   classes (`TrieNode`, `Trie`, `ClosedChoice`) are pydantic models.
 - **Fail per prompt, not per run.** A prompt that fails (or is empty) is
@@ -208,20 +219,26 @@ quotes that word.
 
 ## Performance analysis
 
-Measured on an Apple M3 Pro with the provided input files:
+Measured on an Apple M3 Pro with the evaluation tester (moulinette),
+which calls each chosen function with the generated arguments and
+compares the return value:
 
-| Metric | Result |
-|---|---|
-| Function selection | 11/11 |
-| Fully correct calls (name and all arguments) | 11/11 |
-| Valid JSON / schema-compliant output | 100% (guaranteed by construction) |
-| Total run time, including model loading | ~30 s |
+| Metric | Public set | Private set |
+|---|---|---|
+| Fully correct calls (name and all arguments) | 11/11 | 11/11 |
+| Valid JSON / schema-compliant output | 100% | 100% |
+| Total run time, including model loading | ~55 s | ~65 s |
+
+Generation is deterministic, so repeated runs give the same output.
 
 Known weak spots:
 
 - Quotes inside a string argument: the model tends to end the string at
   the first `"` instead of writing `\"`.
-- The model sometimes drops the sign of a negative number.
+- String values longer than 64 tokens are cut off, and numbers in
+  exponent notation (`2.5e-3`) are not supported.
+- Leading and trailing spaces are trimmed from string values, so an
+  argument that is only spaces (`' '`) becomes empty.
 - Each step re-encodes the whole prefix (no key/value cache), so the time
   per token grows with the prompt length.
 
@@ -230,7 +247,11 @@ Known weak spots:
 - **Token boundaries.** Tokens do not line up with JSON syntax: one token
   can contain the end of a string and the following `",`. Closing tokens
   are recognised by the quote inside them, and only the part before the
-  quote is kept.
+  quote is kept. The same problem appears at the start of a value: the
+  evaluation tester showed that negative signs, leading slashes and
+  prefix function names were lost because the skeleton split tokens the
+  model normally writes whole. This was fixed with token healing (see
+  the JSON skeleton section).
 - **Byte-level vocabulary.** Tokens are stored as mapped characters, not
   raw bytes, so the GPT-2 byte mapping had to be reversed before any
   comparison was possible.
@@ -238,20 +259,23 @@ Known weak spots:
   the model's unconstrained top choice is used to decide when to stop.
 - **Regex arguments.** The model copied text from the prompt (`34`
   instead of `\d+`) and backslashes were originally banned. This was
-  fixed with escape-aware string decoding, a clearer system prompt with a
-  generic example, and the alias dictionary.
+  fixed with escape-aware string decoding and a clearer system prompt
+  with generic examples.
 - **Empty prompts.** An empty request made the model copy the example
   from the system prompt, so empty prompts are now skipped.
 
 ## Testing strategy
 
 - `make lint` (flake8 and mypy with the required flags) must pass.
+- The evaluation tester (moulinette) on both its public and private
+  sets, plus extra sets in the same format (negative numbers, paths,
+  prefix function names, long strings) graded with the same rule.
 - Full runs on the provided files, checking every name and argument by
   hand.
 - Extra prompt sets for strings that need escapes (backslashes, quotes,
   `\d+`, `\s+`), symbol words ("hashes", "dashes"), quoted words that
-  must not be replaced, unicode, large and negative numbers, and empty
-  prompts.
+  must be kept as written, unicode, large and negative numbers, paths,
+  function names that are prefixes of each other, and empty prompts.
 - Broken inputs: missing file, empty file, invalid JSON, an object
   instead of an array, wrong value types, unsupported parameter types, a
   function without parameters, an empty prompt list, and an output path
@@ -279,7 +303,14 @@ AI (Claude) was used as an assistant during development:
 - Adding exception handling to `src/callmemaybe.py` and improving the
   Makefile `clean` rule and `.gitignore`.
 - Investigating the wrong regex arguments: comparing system prompt
-  variants, adding escape-aware string decoding and the alias dictionary.
-- Testing edge cases and drafting this README.
+  variants, adding escape-aware string decoding and an alias dictionary
+  (later removed).
+- Adding the `integer` parameter type after it was caught during
+  evaluation.
+- Diagnosing the token boundary problems (negative signs, leading
+  slashes, prefix function names) found with the evaluation tester, and
+  comparing system prompt examples to choose the final pair.
+- Testing edge cases, running the evaluation tester, and drafting this
+  README.
 
 All generated code was reviewed, tested and adjusted before being kept.

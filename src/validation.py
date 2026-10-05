@@ -6,10 +6,10 @@ from typing import Literal, Any
 
 
 class ParameterType(BaseModel):
-    """This specifies that a parameter can be one of three things"""
+    """This specifies that a parameter can be one of four things"""
     model_config = ConfigDict(extra="forbid")
 
-    type: Literal["number", "string", "boolean"]
+    type: Literal["number", "string", "boolean", "integer"]
 
 
 class FunctionDefinition(BaseModel):
@@ -59,7 +59,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        default=Path("data/output/function_calling_results.json"),
+        default=Path("data/output/function_calls.json"),
         help="Path to the function calls output."
     )
     return parser.parse_args()

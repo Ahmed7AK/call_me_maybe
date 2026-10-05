@@ -10,6 +10,9 @@ from .vocab import get_vocab_bytes, token_to_bytes
 # Bytes that a number can contain
 NUMBER_BYTES = set(b"0123456789.-")
 
+# Bytes that an integer can contain
+INTEGER_BYTES = set(b"0123456789-")
+
 # Control bytes are never allowed inside a JSON string
 CONTROL_BYTES = set(range(0x20))
 
@@ -83,6 +86,31 @@ def number_token_ids() -> set[int]:
     )
 
 
+@lru_cache(maxsize=1)
+def integer_token_ids() -> set[int]:
+    """Returns token_ids for valid integer patterns"""
+    return set(
+        token_id
+        for token_id, data in enumerate(get_vocab_bytes())
+        if data and all(byte in INTEGER_BYTES for byte in data)
+    )
+
+
+@lru_cache(maxsize=2)
+def number_opening_ids(integer: bool) -> set[int]:
+    """
+    Returns token_ids that may open a number value right after the
+    colon: a plain number token, or one led by a single space (" -")
+    """
+    digits = INTEGER_BYTES if integer else NUMBER_BYTES
+    return set(
+        token_id
+        for token_id, data in enumerate(get_vocab_bytes())
+        if data
+        and all(byte in digits for byte in data.removeprefix(b" "))
+    )
+
+
 def _scan_string_token(
     data: bytes, escaped: bool
 ) -> tuple[int | None, bool] | None:
@@ -124,6 +152,31 @@ def string_tokens(
         else:
             closing[token_id] = data[:quote_index]
     return content, closing, set(content) | set(closing)
+
+
+@lru_cache(maxsize=1)
+def string_opening_tokens() -> tuple[dict[int, bool], dict[int, bytes]]:
+    """
+    Returns tokens that may open a string value right after the colon:
+    an optional space, the opening quote, then any valid content (e.g.
+    ' "/' for a path). Maps each to the escape state it leaves behind,
+    or to its content when the token also closes the string
+    """
+    content: dict[int, bool] = {}
+    closing: dict[int, bytes] = {}
+    for token_id, data in enumerate(get_vocab_bytes()):
+        rest = data.removeprefix(b" ")
+        if not rest.startswith(b'"'):
+            continue
+        scan = _scan_string_token(rest[1:], False)
+        if scan is None:
+            continue
+        quote_index, ends_escaped = scan
+        if quote_index is None:
+            content[token_id] = ends_escaped
+        else:
+            closing[token_id] = rest[1:][:quote_index]
+    return content, closing
 
 
 def masked_argmax(logits: Sequence[float], allowed: set[int]) -> int:
