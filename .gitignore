@@ -15,3 +15,7 @@ data/output/
 
 # OS
 .DS_Store
+
+# AI assistant configuration (not part of the submission)
+.claude/
+.codex/
